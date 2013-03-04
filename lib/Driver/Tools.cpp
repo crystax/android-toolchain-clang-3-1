@@ -5457,9 +5457,13 @@ void linuxtools::Link::ConstructJob(Compilation &C, const JobAction &JA,
 
       // zuav: link libcrystax by default
       if (isAndroid) {
-          CmdArgs.push_back("-Bstatic");
-          CmdArgs.push_back("-lcrystax");
-          CmdArgs.push_back("-Bdynamic");
+          if (Args.hasArg(options::OPT_static))
+              CmdArgs.push_back("-lcrystax");
+          else {
+              CmdArgs.push_back("-Bstatic");
+              CmdArgs.push_back("-lcrystax");
+              CmdArgs.push_back("-Bdynamic");
+          }
           CmdArgs.push_back("-lm");
       }
 
