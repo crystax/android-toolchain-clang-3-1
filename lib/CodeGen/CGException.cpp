@@ -954,9 +954,20 @@ static void InitCatchParam(CodeGenFunction &CGF,
 
         // Exn points to the struct _Unwind_Exception header, which
         // we have to skip past in order to reach the exception data.
-        unsigned HeaderSize =
-          CGF.CGM.getTargetCodeGenInfo().getSizeOfUnwindException();
-        AdjustedExn = CGF.Builder.CreateConstGEP1_32(Exn, HeaderSize);
+        if (CGF.Target.getTriple().getArch() == llvm::Triple::le32 &&
+            CGF.Target.getTriple().getOS() == llvm::Triple::NDK) {
+          // le32-none-ndk uses intrinsic to solve different unwind header size
+          llvm::FunctionType *FTy =
+            llvm::FunctionType::get(CGF.SizeTy, /*IsVarArgs=*/false);
+          llvm::Constant *Fn =
+            CGF.CGM.CreateRuntimeFunction(FTy, "__ndk_le32_getUnwindHeaderSize");
+          llvm::CallInst *Ptr = CGF.Builder.CreateCall(Fn);
+          AdjustedExn = CGF.Builder.CreateInBoundsGEP(Exn, Ptr);
+        } else {
+          unsigned HeaderSize =
+            CGF.CGM.getTargetCodeGenInfo().getSizeOfUnwindException();
+          AdjustedExn = CGF.Builder.CreateConstGEP1_32(Exn, HeaderSize);
+        }
 
       // However, if we're catching a pointer-to-record type that won't
       // work, because the personality function might have adjusted
@@ -1130,14 +1141,6 @@ static void BeginCatch(CodeGenFunction &CGF, const CXXCatchStmt *S) {
   CGF.EmitAutoVarCleanups(var);
 }
 
-namespace {
-  struct CallRethrow : EHScopeStack::Cleanup {
-    void Emit(CodeGenFunction &CGF, Flags flags) {
-      CGF.EmitCallOrInvoke(getReThrowFn(CGF));
-    }
-  };
-}
-
 /// Emit the structure of the dispatch block for the given catch scope.
 /// It is an invariant that the dispatch block already exists.
 static void emitCatchDispatchBlock(CodeGenFunction &CGF,
@@ -1249,11 +1252,12 @@ void CodeGenFunction::ExitCXXTryStmt(const CXXTryStmt &S, bool IsFnTryBlock) {
   if (HaveInsertPoint())
     Builder.CreateBr(ContBB);
 
-  // Determine if we need an implicit rethrow for all these catch handlers.
-  bool ImplicitRethrow = false;
+  // Determine if we need an implicit rethrow for all these catch handlers;
+  // see the comment below.
+  bool doImplicitRethrow = false;
   if (IsFnTryBlock)
-    ImplicitRethrow = isa<CXXDestructorDecl>(CurCodeDecl) ||
-                      isa<CXXConstructorDecl>(CurCodeDecl);
+    doImplicitRethrow = isa<CXXDestructorDecl>(CurCodeDecl) ||
+                        isa<CXXConstructorDecl>(CurCodeDecl);
 
   // Perversely, we emit the handlers backwards precisely because we
   // want them to appear in source order.  In all of these cases, the
@@ -1276,14 +1280,23 @@ void CodeGenFunction::ExitCXXTryStmt(const CXXTryStmt &S, bool IsFnTryBlock) {
     // Initialize the catch variable and set up the cleanups.
     BeginCatch(*this, C);
 
-    // If there's an implicit rethrow, push a normal "cleanup" to call
-    // _cxa_rethrow.  This needs to happen before __cxa_end_catch is
-    // called, and so it is pushed after BeginCatch.
-    if (ImplicitRethrow)
-      EHStack.pushCleanup<CallRethrow>(NormalCleanup);
-
     // Perform the body of the catch.
     EmitStmt(C->getHandlerBlock());
+
+    // [except.handle]p11:
+    //   The currently handled exception is rethrown if control
+    //   reaches the end of a handler of the function-try-block of a
+    //   constructor or destructor.
+
+    // It is important that we only do this on fallthrough and not on
+    // return.  Note that it's illegal to put a return in a
+    // constructor function-try-block's catch handler (p14), so this
+    // really only applies to destructors.
+    if (doImplicitRethrow && HaveInsertPoint()) {
+      EmitCallOrInvoke(getReThrowFn(*this));
+      Builder.CreateUnreachable();
+      Builder.ClearInsertionPoint();
+    }
 
     // Fall out through the catch cleanups.
     CatchScope.ForceCleanup();
